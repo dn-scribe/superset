@@ -1,0 +1,218 @@
+name: fst-docker-build-process
+
+env:
+  FS_DIGEST: ":v0.0.21"
+  FS_NAME: fs-tracker-${{ github.run_id }}
+  FS_DIR: /tmp/fs-tracker-${{ github.run_id }}
+
+on:
+  workflow_dispatch:
+
+jobs:
+  fs-tracker-vue-project-ci-job:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Install Valint
+        run: | 
+          curl -sSfL https://get.scribesecurity.com/install.sh  | sh -s -- -t valint
+          mv  /home/runner/.scribe/bin/valint /usr/local/bin/valint
+          valint --version
+
+      # - name: Login to DockerHub
+      #   uses: docker/login-action@v1
+      #   with:
+      #     username: ${{ secrets.DOCKERHUB_USERNAME }}
+      #     password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+      - name: Pull fst-docker-processing image
+        run: docker pull scribesecurity/fstsboms:latest  
+
+          
+      - name: Create fs-tracker work dir and rules file
+        id: create-fs-tracker-work-dir-and-rules-file
+        env:
+          STEP_NAME: Create fs-tracker work dir and rules file
+        run: |
+          mkdir -p $FS_DIR
+          echo '{"ALL": {"filters": {"events": ["all"]}}}' > $FS_DIR/rules.json
+
+      - name: Start fs-tracker container
+        id: start-fs-tracker-container
+        env:
+          STEP_NAME: Start fs-tracker container
+        run: >
+          docker run -d 
+          --privileged 
+          --pid=host 
+          --userns=host
+          --name $FS_NAME
+          -v /proc:/proc 
+          -v /etc/passwd:/etc/passwd 
+          -v $FS_DIR:/work 
+          -w /work 
+          scribesecuriy.jfrog.io/scribe-docker-public-local/fs-tracker$FS_DIGEST 
+          -f jsonl
+
+      - name: Wait for fs-tracker initialisation
+        id: fs-tracker-initialization
+        env:
+          STEP_NAME: Wait for fs-tracker initialisation
+        run: |
+          while [ $(docker container inspect $FS_NAME --format {{.State.Status}}) == "running" ]
+          do
+            if docker logs $FS_NAME 2>/dev/null | grep '^Ready!' >/dev/null
+            then
+              echo Ready!
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Clone repo
+        id: clone-repo
+        env:
+          STEP_NAME: Clone repo
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v2
+        with:
+          node-version: '14'
+
+      - name: Create Soureces SBOM
+        id: valint-sources
+        run: valint bom git:$(pwd) --output-file ${{ env.FS_DIR }}/source-sbom.json --components files,dep,commits
+
+      - name: Install app dependencies
+        env:
+          STEP_NAME: Install app dependencies
+        run: | 
+          cd superset-frontend
+          npm install
+          npm run build
+
+      # - name: Build app
+      #   id: build-app
+      #   env:
+      #     STEP_NAME: Build app
+      #   run: npm run build
+
+      - name: Create build SBOM
+        id: valint-build
+        run: valint bom dir:. --output-file ${{ env.FS_DIR }}/build-sbom.json --components metadata,packages,files,dep -vv
+
+      - name: Compress build artifacts
+        id: compress-build-artifacts
+        env:
+          STEP_NAME: Compress build artifacts
+        run: |
+          tar -cJf dist.tar.xz dist
+
+      - name: Stop fs-tracker
+        id: stop-fs-tracker
+        env:
+          STEP_NAME: Stop fs-tracker
+        run: |
+          docker stop $FS_NAME
+          docker logs $FS_NAME
+          EXIT_CODE=$(docker wait $FS_NAME)
+          docker rm --force $FS_NAME
+
+      - name: Compress fs-tracker logs
+        id: compress-fs-tracker-logs
+        env:
+          STEP_NAME: Compress fs-tracker logs
+        run: |
+          tar -cJf $FS_DIR/fs-tracker-logs.tar.xz -C $FS_DIR processes.json events.json
+
+      - name: Archive fs-tracker logs
+        id: archive-fs-tracker-logs
+        env:
+          STEP_NAME: Archive fs-tracker logs
+        uses: actions/upload-artifact@v3
+        with:
+          name: fs-tracker-logs
+          path: |
+            ${{ env.FS_DIR }}/fs-tracker-logs.tar.xz
+
+      - name: upload events to database + create full tools sbom
+        run: | 
+          if ! command -v jq &> /dev/null; then
+            echo "jq is not installed. Trying to install..."
+              sudo apt-get update
+              sudo apt-get install jq
+          fi
+
+          # Extract metadata to metadata.json
+          jq '.metadata' ${{ env.FS_DIR }}/build-sbom.json > ${{ env.FS_DIR }}/metadata.json
+
+          docker run -v ${{ env.FS_DIR }}:/logs scribesecurity/fstsboms:latest \
+          python ../tools-sbom.py \
+          --output full-tools-sbom.json \
+          --metadata metadata.json
+
+          docker run -v ${{ env.FS_DIR }}:/logs scribesecurity/fstsboms:latest \
+          python ../tools-sbom.py \
+          --skip \
+          --commands "npm install" "npm run build" \
+          --output npm-tools-sbom.json \
+          --metadata metadata.json
+
+          docker run -v ${{ env.FS_DIR }}:/logs scribesecurity/fstsboms:latest \
+          python ../procs-tree.py \
+          --skip \
+          --commands "npm install" "npm run build" \
+          --output npm-procs-tree.csv
+
+          docker run -v ${{ env.FS_DIR }}:/logs scribesecurity/fstsboms:latest \
+          python ../procs-tree.py \
+          --skip \
+          --output full-procs-tree.csv
+
+      - name: Install grype
+        run: |
+          wget -qO - https://raw.githubusercontent.com/anchore/grype/main/install.sh | sudo bash -s -- -b /usr/local/bin
+          grype version
+      
+      - name: Generate reduced sbom artifacts
+        run: |
+          docker run -v ${{ env.FS_DIR }}:/logs scribesecurity/fstsboms:latest \
+          python ../reduced-packages-sbom.py --input build-sbom.json --output reduced-build-sbom.json --commands 'npm run build' --report reduce-report.json
+
+          grype sbom:${{ env.FS_DIR }}/syft.json -o table --file ${{ env.FS_DIR }}/build-sbom-vulns.txt
+          grype sbom:${{ env.FS_DIR }}/syft-modified.json -o table --file ${{ env.FS_DIR }}/build-sbom-modified-vulns.txt
+
+      - name: Enhance SBOM with source-used data
+        run: >
+          docker run -v ${{ env.FS_DIR }}:/logs scribesecurity/fstsboms:latest
+          python ../enhanced-source-sbom.py
+          --events events.json
+          --processes processes.json
+          --input source-sbom.json 
+          --output enhanced-source-sbom.json
+          --commands 'npm run build'
+
+      - name: upload fst-artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: fs-tracker-artifacts
+          path: |
+            ${{ env.FS_DIR }}/source-sbom.json
+            ${{ env.FS_DIR }}/build-sbom.json
+            ${{ env.FS_DIR }}/full-tools-sbom.json
+            ${{ env.FS_DIR }}/npm-tools-sbom.json
+            ${{ env.FS_DIR }}/metadata.json
+            ${{ env.FS_DIR }}/npm-procs-tree.csv
+            ${{ env.FS_DIR }}/full-procs-tree.csv
+            ${{ env.FS_DIR }}/reduced-build-sbom.json
+            ${{ env.FS_DIR }}/enhanced-source-sbom.json
+            ${{ env.FS_DIR }}/reduce-report.json
+            ${{ env.FS_DIR }}/syft.json
+            ${{ env.FS_DIR }}/syft-modified.json
+            ${{ env.FS_DIR }}/build-sbom-vulns.txt
+            ${{ env.FS_DIR }}/build-sbom-modified-vulns.txt
